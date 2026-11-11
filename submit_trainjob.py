@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Create one Trainer v2 TrainJob and wait for it to finish."""
+
+import argparse
+import json
+import ssl
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+NAMESPACE = "cv-shard-training"
+RUNTIME = "torch-distributed-cuda130-torch211-py312"
+API = "https://kubernetes.default.svc"
+TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+SUCCESS = {"Complete", "Succeeded"}
+FAILURE = {"Failed"}
+
+
+def k8s(method, path, body=None, timeout=60):
+    token = Path(TOKEN_PATH).read_text(encoding="utf-8").strip()
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(API + path, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {token}")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    context = ssl.create_default_context(cafile=CA_PATH)
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=timeout) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"{method} {path} failed: {error.code} {detail}") from error
+    if not payload:
+        return {}
+    text = payload.decode("utf-8")
+    if text[:1] in "{[":
+        return json.loads(text)
+    return text
+
+
+def build_train_job(name, shard_dir, suspend=False):
+    return {
+        "apiVersion": "trainer.kubeflow.org/v1alpha1",
+        "kind": "TrainJob",
+        "metadata": {"name": name, "namespace": NAMESPACE},
+        "spec": {
+            "suspend": suspend,
+            "runtimeRef": {
+                "name": RUNTIME,
+                "kind": "ClusterTrainingRuntime",
+                "apiGroup": "trainer.kubeflow.org",
+            },
+            "trainer": {
+                "numNodes": 2,
+                "numProcPerNode": 1,
+                "resourcesPerNode": {
+                    "requests": {"cpu": "4", "memory": "24Gi", "nvidia.com/gpu": "1"},
+                    "limits": {"cpu": "4", "memory": "24Gi", "nvidia.com/gpu": "1"},
+                },
+                "env": [{"name": "PYTHONPATH", "value": "/data/pydeps"}],
+                "command": ["bash", "/data/code/torchrun.sh", shard_dir],
+            },
+            "podTemplateOverrides": [
+                {
+                    "targetJobs": [{"name": "node"}],
+                    "spec": {
+                        "tolerations": [
+                            {
+                                "key": "nvidia.com/gpu",
+                                "operator": "Exists",
+                                "effect": "NoSchedule",
+                            }
+                        ],
+                        "volumes": [
+                            {
+                                "name": "data",
+                                "persistentVolumeClaim": {"claimName": "cv-data"},
+                            },
+                            {
+                                "name": "dshm",
+                                "emptyDir": {"medium": "Memory", "sizeLimit": "2Gi"},
+                            },
+                        ],
+                        "containers": [
+                            {
+                                "name": "node",
+                                "volumeMounts": [
+                                    {"name": "data", "mountPath": "/data"},
+                                    {"name": "dshm", "mountPath": "/dev/shm"},
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    }
+
+
+def condition_map(job):
+    found = {}
+    for condition in job.get("status", {}).get("conditions", []) or []:
+        found[condition.get("type", "")] = condition
+    return found
+
+
+def matching_pods(name):
+    listing = k8s("GET", f"/api/v1/namespaces/{NAMESPACE}/pods")
+    pods = []
+    for pod in listing.get("items", []):
+        if name in pod["metadata"]["name"]:
+            pods.append(pod)
+    return pods
+
+
+def describe_pods(name):
+    lines = []
+    for pod in matching_pods(name):
+        phase = pod.get("status", {}).get("phase", "")
+        node = pod.get("spec", {}).get("nodeName", "")
+        waiting = []
+        for container in pod.get("status", {}).get("containerStatuses", []) or []:
+            state = container.get("state", {})
+            if "waiting" in state:
+                waiting.append(
+                    f"{container['name']} {state['waiting'].get('reason', '')} {state['waiting'].get('message', '')}"
+                )
+        lines.append(f"{pod['metadata']['name']} phase={phase} node={node} {' '.join(waiting)}".rstrip())
+    return lines
+
+
+def wait_for_job(name, timeout_sec):
+    deadline = time.time() + timeout_sec
+    path = f"/apis/trainer.kubeflow.org/v1alpha1/namespaces/{NAMESPACE}/trainjobs/{name}"
+    while time.time() < deadline:
+        job = k8s("GET", path)
+        conditions = condition_map(job)
+        summary = ", ".join(
+            f"{kind}={item.get('status')} {item.get('reason', '')}"
+            for kind, item in conditions.items()
+        )
+        print(f"trainjob {name}: {summary or 'no conditions yet'}", flush=True)
+        for line in describe_pods(name):
+            print(line, flush=True)
+        for kind in FAILURE:
+            item = conditions.get(kind)
+            if item and item.get("status") == "True":
+                raise SystemExit(f"TrainJob failed: {item.get('message', '')}")
+        for kind in SUCCESS:
+            item = conditions.get(kind)
+            if item and item.get("status") == "True":
+                return job
+        time.sleep(20)
+    raise SystemExit(f"TrainJob {name} did not finish within {timeout_sec}s")
+
+
+def tail_rank0(name):
+    prefix = f"{name}-node-0"
+    for pod in matching_pods(name):
+        pod_name = pod["metadata"]["name"]
+        if not pod_name.startswith(prefix):
+            continue
+        text = k8s(
+            "GET",
+            f"/api/v1/namespaces/{NAMESPACE}/pods/{pod_name}/log?container=node&tailLines=50",
+        )
+        print(f"--- log {pod_name} ---", flush=True)
+        print(text if isinstance(text, str) else json.dumps(text), flush=True)
+        return
+
+
+def submit(manifest_path, metrics_path, timeout_sec):
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    shard_dir = manifest["shard_dir"]
+    name = "cv-train-" + time.strftime("%m%d%H%M%S")
+    body = build_train_job(name, shard_dir, suspend=False)
+    print(f"creating TrainJob {name} shards={shard_dir}", flush=True)
+    k8s(
+        "POST",
+        f"/apis/trainer.kubeflow.org/v1alpha1/namespaces/{NAMESPACE}/trainjobs",
+        body,
+    )
+    wait_for_job(name, timeout_sec)
+    try:
+        tail_rank0(name)
+    except SystemExit as error:
+        print(f"pod log unavailable: {error}", flush=True)
+    metrics_file = Path("/data/metrics/train-metrics.json")
+    if not metrics_file.is_file():
+        raise SystemExit("TrainJob finished without /data/metrics/train-metrics.json")
+    target = Path(metrics_path)
+    if target.exists() and target.is_dir():
+        target = target / "train-metrics.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(metrics_file.read_text(encoding="utf-8"), encoding="utf-8")
+    print(metrics_file.read_text(encoding="utf-8"), flush=True)
+    print(f"trainjob={name}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--metrics", required=True)
+    parser.add_argument("--timeout", type=int, default=3600)
+    args = parser.parse_args()
+    submit(args.manifest, args.metrics, args.timeout)
+
+
+if __name__ == "__main__":
+    main()

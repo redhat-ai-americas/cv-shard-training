@@ -1,0 +1,40 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workbench-pipeline-access
+  namespace: cv-shard-training
+subjects:
+  - kind: ServiceAccount
+    name: cv-workbench
+    namespace: cv-shard-training
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ds-pipeline-user-access-dspa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trainjob-submitter
+  namespace: cv-shard-training
+rules:
+  - apiGroups: ["trainer.kubeflow.org"]
+    resources: ["trainjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["jobset.x-k8s.io"]
+    resources: ["jobsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pipeline-runner-trainjobs
+  namespace: cv-shard-training
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-runner-dspa
+    namespace: cv-shard-training
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: trainjob-submitter

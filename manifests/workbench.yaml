@@ -1,0 +1,122 @@
+apiVersion: kubeflow.org/v1
+kind: Notebook
+metadata:
+  name: cv-workbench
+  namespace: cv-shard-training
+  labels:
+    app: cv-workbench
+    opendatahub.io/dashboard: "true"
+    opendatahub.io/odh-managed: "true"
+  annotations:
+    notebooks.opendatahub.io/inject-auth: "true"
+    notebooks.opendatahub.io/last-image-selection: pytorch:3.5
+    notebooks.opendatahub.io/last-image-version-git-commit-selection: 47efb6c
+    opendatahub.io/hardware-profile-name: large-cpu-profile
+    opendatahub.io/hardware-profile-namespace: redhat-ods-applications
+    opendatahub.io/hardware-profile-resource-version: "334089"
+    opendatahub.io/image-display-name: Jupyter | PyTorch | CUDA | Python 3.12
+    opendatahub.io/mlflow-instance: mlflow
+    opendatahub.io/user: admin
+    opendatahub.io/username: admin
+    openshift.io/display-name: CV shard training
+    openshift.io/description: Generate images, pack shards, and launch the training pipeline
+spec:
+  template:
+    spec:
+      containers:
+        - name: cv-workbench
+          image: image-registry.openshift-image-registry.svc:5000/redhat-ods-applications/pytorch:3.5
+          imagePullPolicy: Always
+          workingDir: /opt/app-root/src
+          ports:
+            - containerPort: 8888
+              name: notebook-port
+              protocol: TCP
+          env:
+            - name: NOTEBOOK_ARGS
+              value: |-
+                --ServerApp.port=8888
+                --ServerApp.token=''
+                --ServerApp.password=''
+                --ServerApp.base_url=/notebook/cv-shard-training/cv-workbench
+                --ServerApp.quit_button=False
+            - name: JUPYTER_IMAGE
+              value: image-registry.openshift-image-registry.svc:5000/redhat-ods-applications/pytorch:3.5
+            - name: PIP_CERT
+              value: /etc/pki/tls/custom-certs/ca-bundle.crt
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/pki/tls/custom-certs/ca-bundle.crt
+            - name: SSL_CERT_FILE
+              value: /etc/pki/tls/custom-certs/ca-bundle.crt
+            - name: PIPELINES_SSL_SA_CERTS
+              value: /etc/pki/tls/custom-certs/ca-bundle.crt
+            - name: KF_PIPELINES_SSL_SA_CERTS
+              value: /etc/pki/tls/custom-certs/ca-bundle.crt
+            - name: GIT_SSL_CAINFO
+              value: /etc/pki/tls/custom-certs/ca-bundle.crt
+            - name: MLFLOW_K8S_INTEGRATION
+              value: "true"
+            - name: MLFLOW_TRACKING_AUTH
+              value: kubernetes-namespaced
+            - name: MLFLOW_TRACKING_URI
+              value: https://rh-ai.apps.ocp.9j696.sandbox5421.opentlc.com/mlflow
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+          readinessProbe:
+            httpGet:
+              path: /notebook/cv-shard-training/cv-workbench/api
+              port: notebook-port
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /notebook/cv-shard-training/cv-workbench/api
+              port: notebook-port
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: cv-workbench
+              mountPath: /opt/app-root/src
+            - name: cv-data
+              mountPath: /opt/app-root/src/data
+            - name: shm
+              mountPath: /dev/shm
+            - name: trusted-ca
+              mountPath: /etc/pki/tls/custom-certs
+              readOnly: true
+            - name: runtime-images
+              mountPath: /opt/app-root/pipeline-runtimes
+      enableServiceLinks: false
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: cv-workbench
+          persistentVolumeClaim:
+            claimName: cv-workbench
+        - name: cv-data
+          persistentVolumeClaim:
+            claimName: cv-data
+        - name: shm
+          emptyDir:
+            medium: Memory
+        - name: trusted-ca
+          configMap:
+            name: workbench-trusted-ca-bundle
+            optional: true
+        - name: runtime-images
+          configMap:
+            name: pipeline-runtime-images
+            optional: true

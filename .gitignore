@@ -1,0 +1,6 @@
+.tmp-*
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+cv_shard_pipeline.yaml
+restore/

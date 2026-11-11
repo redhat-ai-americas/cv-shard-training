@@ -1,0 +1,32 @@
+apiVersion: datasciencepipelinesapplications.opendatahub.io/v1
+kind: DataSciencePipelinesApplication
+metadata:
+  name: dspa
+  namespace: cv-shard-training
+spec:
+  apiServer:
+    deploy: true
+    enableSamplePipeline: false
+  persistenceAgent:
+    deploy: true
+  scheduledWorkflow:
+    deploy: true
+  workflowController:
+    deploy: true
+  database:
+    mariaDB:
+      deploy: true
+      pipelineDBName: mlpipeline
+      pvcSize: 10Gi
+      storageClassName: gp3-csi
+      username: mlpipeline
+  objectStorage:
+    externalStorage:
+      bucket: cv-shard-pipelines-9j696
+      host: s3.us-east-2.amazonaws.com
+      region: us-east-2
+      scheme: https
+      s3CredentialsSecret:
+        secretName: aws-s3-pipelines
+        accessKey: AWS_ACCESS_KEY_ID
+        secretKey: AWS_SECRET_ACCESS_KEY
