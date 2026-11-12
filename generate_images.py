@@ -332,16 +332,17 @@ def class_lines(path):
 
 def sync_folder(folder, n_images):
     folder.mkdir(parents=True, exist_ok=True)
-    keep = {f"{index:06d}.jpg" for index in range(n_images)}
+    present = set()
     for path in folder.glob("*.jpg"):
-        if path.name not in keep or path.stat().st_size == 0:
+        if not path.stem.isdigit():
             path.unlink()
-    missing = []
-    for index in range(n_images):
-        path = folder / f"{index:06d}.jpg"
-        if not (path.is_file() and path.stat().st_size > 0):
-            missing.append(index)
-    return missing
+            continue
+        index = int(path.stem)
+        if index >= n_images or path.stat().st_size == 0:
+            path.unlink()
+            continue
+        present.add(index)
+    return [index for index in range(n_images) if index not in present]
 
 
 def _write_one(task):

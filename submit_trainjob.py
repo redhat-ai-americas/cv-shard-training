@@ -41,7 +41,14 @@ def k8s(method, path, body=None, timeout=60):
     return text
 
 
-def build_train_job(name, manifest_path, phase, suspend=False):
+def build_train_job(name, manifest_path, phase, metrics_dir, checkpoint, epochs, suspend=False):
+    env = [
+        {"name": "PYTHONPATH", "value": "/data/pydeps"},
+        {"name": "METRICS_DIR", "value": metrics_dir},
+        {"name": "CHECKPOINT", "value": checkpoint},
+    ]
+    if epochs:
+        env.append({"name": "EPOCHS", "value": str(epochs)})
     return {
         "apiVersion": "trainer.kubeflow.org/v1alpha1",
         "kind": "TrainJob",
@@ -60,7 +67,7 @@ def build_train_job(name, manifest_path, phase, suspend=False):
                     "requests": {"cpu": "4", "memory": "24Gi", "nvidia.com/gpu": "1"},
                     "limits": {"cpu": "4", "memory": "24Gi", "nvidia.com/gpu": "1"},
                 },
-                "env": [{"name": "PYTHONPATH", "value": "/data/pydeps"}],
+                "env": env,
                 "command": ["bash", "/data/code/torchrun.sh", manifest_path, phase],
             },
             "podTemplateOverrides": [
@@ -172,7 +179,7 @@ def tail_rank0(name):
         return
 
 
-def submit(manifest_path, metrics_path, timeout_sec, phase):
+def submit(manifest_path, metrics_path, timeout_sec, phase, metrics_dir, checkpoint, epochs):
     if phase not in {"train", "eval"}:
         raise SystemExit(f"unknown phase {phase}")
     source = Path(manifest_path)
@@ -186,9 +193,10 @@ def submit(manifest_path, metrics_path, timeout_sec, phase):
     if not Path(job_manifest).is_file():
         raise SystemExit(f"missing manifest on the shared volume: {job_manifest}")
     prefix = "cv-eval-" if phase == "eval" else "cv-train-"
-    produced = "/data/metrics/test-metrics.json" if phase == "eval" else "/data/metrics/train-metrics.json"
+    filename = "test-metrics.json" if phase == "eval" else "train-metrics.json"
+    produced = f"{metrics_dir.rstrip('/')}/{filename}"
     name = prefix + time.strftime("%m%d%H%M%S")
-    body = build_train_job(name, job_manifest, phase, suspend=False)
+    body = build_train_job(name, job_manifest, phase, metrics_dir, checkpoint, epochs)
     print(f"creating TrainJob {name} phase={phase} manifest={job_manifest}", flush=True)
     k8s(
         "POST",
@@ -218,8 +226,19 @@ def main():
     parser.add_argument("--metrics", required=True)
     parser.add_argument("--phase", choices=("train", "eval"), default="train")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_SEC)
+    parser.add_argument("--metrics-dir", default="/data/metrics")
+    parser.add_argument("--checkpoint", default="/data/models/resnet18.pt")
+    parser.add_argument("--epochs", type=int, default=0)
     args = parser.parse_args()
-    submit(args.manifest, args.metrics, args.timeout, args.phase)
+    submit(
+        args.manifest,
+        args.metrics,
+        args.timeout,
+        args.phase,
+        args.metrics_dir,
+        args.checkpoint,
+        args.epochs,
+    )
 
 
 if __name__ == "__main__":

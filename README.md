@@ -2,7 +2,7 @@
 
 OpenShift AI 3.5 demo of an overhead image classifier. A notebook generates synthetic 256×256 JPEGs of trucks, boats, planes, and buildings. A Kubeflow pipeline then splits that corpus, packs WebDataset shards, submits distributed training, and evaluates the held-out shards.
 
-The current run is 20,000 images and one training epoch. That is a size and time choice for the demo, not a limit of ResNet18. [scaling-to-one-million.md](scaling-to-one-million.md) is the checklist for a larger run.
+The demo defaults are 20,000 images and one training epoch. That is a size and time choice, not a limit of ResNet18. A million-image run already finished on the cluster. [scaling-to-one-million.md](scaling-to-one-million.md) records that result and the knobs for another one.
 
 ## How the pieces fit
 
@@ -19,7 +19,7 @@ The TrainJob uses runtime `torch-distributed-cuda130-torch211-py312`. WebDataset
 
 ## What a successful run records
 
-Pipeline `overhead-shard-training` version `v1`. The pipeline experiment and the MLflow experiment share that name. On the 20,000-image run the nested runs held:
+Pipeline `overhead-shard-training`. The pipeline experiment and the MLflow experiment share that name. The numbers below are the 20,000-image run, which used version `v1`. The current graph is version `v2`, because a pipeline version cannot be edited in place. On that run the nested runs held:
 
 | Step | Metrics |
 | --- | --- |
@@ -28,7 +28,7 @@ Pipeline `overhead-shard-training` version `v1`. The pipeline experiment and the
 | `train` | `loss`, `train_accuracy`, `images_per_sec` |
 | `evaluate` | `test_loss`, `test_accuracy`, `test_images` |
 
-`loss` and `train_accuracy` are the last epoch. With the default of one epoch, that is the whole fit. `epoch_seconds` in the JSON is the wall time of the fit.
+`loss` and `train_accuracy` are the last epoch. With the default of one epoch, that is the whole fit. `epoch_seconds` in the JSON is the wall time of the fit. The train JSON also keeps a `history` list, one loss and accuracy per epoch. The train step logs those points onto the nested MLflow run when the platform has injected `MLFLOW_RUN_ID`. Until `injectUserEnvVars` is turned on, MLflow still shows the single last-epoch scalars.
 
 ## Assumptions
 
@@ -47,7 +47,7 @@ The manifests use storage classes `efs-csi` (shared data) and `gp3-csi` (workben
 | `train.py` | ResNet18 from scratch. `--phase train` fits `EPOCHS` and saves a checkpoint. `--phase eval` scores the test shards |
 | `submit_trainjob.py` | Create one TrainJob for the train phase or the eval phase and wait for it |
 | `torchrun.sh` | Launch `train.py` with the phase and the `PET_*` values injected by the Trainer runtime |
-| `pipeline.py` | Registers pipeline `overhead-shard-training` version `v1`, then starts a run |
+| `pipeline.py` | Registers pipeline `overhead-shard-training` version `v2`, then starts a run |
 | `scaling-to-one-million.md` | What to change for a million images and more epochs |
 | `manifests/` | Project, volumes, workbench, pipeline server, workflow trust config, and TrainJob RBAC |
 
@@ -64,4 +64,4 @@ The manifests use storage classes `efs-csi` (shared data) and `gp3-csi` (workben
    ```
 
 6. Run `demo.ipynb` from the top. The generator stamp is `overhead-silhouettes-v1`. A later run with the same stamp, class list, and count skips JPEGs that are already there.
-7. Open **Develop and train → Pipelines**. The run is listed under pipeline `overhead-shard-training`, version `v1`, with steps `split-dataset`, `pack-shards`, `train`, and `evaluate`. Open the nested MLflow runs to see the metrics. The parent run has none.
+7. Open **Develop and train → Pipelines**. The next run is listed under pipeline `overhead-shard-training`, version `v2`, with steps `split-dataset`, `pack-shards`, `train`, and `evaluate`. Open the nested MLflow runs to see the metrics. The parent run has none. Version `v1` remains the earlier graph.

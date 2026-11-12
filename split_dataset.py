@@ -73,13 +73,21 @@ def artifact_file(path, filename):
     return target
 
 
-def write_split(raw_dir, output_path, test_fraction=TEST_FRACTION, split_seed=SPLIT_SEED):
+def write_split(
+    raw_dir,
+    output_path,
+    test_fraction=TEST_FRACTION,
+    split_seed=SPLIT_SEED,
+    max_per_class=0,
+    shared_path="",
+):
     if not 0 < test_fraction < 1:
         raise SystemExit("test fraction must be between 0 and 1")
     classes = load_classes(raw_dir)
-    train_samples, test_samples = stratified_split(
-        collect_samples(raw_dir, classes), test_fraction, split_seed
-    )
+    grouped = collect_samples(raw_dir, classes)
+    if max_per_class > 0:
+        grouped = [group[:max_per_class] for group in grouped]
+    train_samples, test_samples = stratified_split(grouped, test_fraction, split_seed)
     train_counts = count_classes(train_samples, classes)
     test_counts = count_classes(test_samples, classes)
     payload = {
@@ -96,7 +104,7 @@ def write_split(raw_dir, output_path, test_fraction=TEST_FRACTION, split_seed=SP
         "train": as_records(train_samples),
         "test": as_records(test_samples),
     }
-    shared = Path("/data/splits/split.json")
+    shared = Path(shared_path) if shared_path else Path("/data/splits/split.json")
     if str(raw_dir).startswith("/data"):
         payload["split_path"] = str(shared)
     encoded = json.dumps(payload) + "\n"
@@ -118,8 +126,17 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--test-fraction", type=float, default=TEST_FRACTION)
     parser.add_argument("--split-seed", type=int, default=SPLIT_SEED)
+    parser.add_argument("--max-per-class", type=int, default=0)
+    parser.add_argument("--shared", default="")
     args = parser.parse_args()
-    write_split(args.raw, args.output, args.test_fraction, args.split_seed)
+    write_split(
+        args.raw,
+        args.output,
+        args.test_fraction,
+        args.split_seed,
+        args.max_per_class,
+        args.shared,
+    )
 
 
 if __name__ == "__main__":

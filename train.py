@@ -68,7 +68,7 @@ def build_loader(paths, batch_size, workers):
     )
 
 
-CHECKPOINT = "/data/models/resnet18.pt"
+CHECKPOINT = os.environ.get("CHECKPOINT", "/data/models/resnet18.pt")
 LEARNING_RATE = 0.05
 EPOCHS = 1
 
@@ -154,6 +154,7 @@ def main():
         first_batch = None
         total_images = 0.0
         last_reduced = None
+        history = []
         for epoch in range(args.epochs):
             images = 0
             correct = 0
@@ -187,6 +188,13 @@ def main():
                     f"accuracy={epoch_accuracy:.4f}",
                     flush=True,
                 )
+                history.append(
+                    {
+                        "epoch": epoch + 1,
+                        "loss": round(epoch_loss, 4),
+                        "accuracy": round(epoch_accuracy, 4),
+                    }
+                )
         if first_batch is None:
             first_batch = time.perf_counter() - started
         elapsed = time.perf_counter() - started
@@ -207,6 +215,7 @@ def main():
                     "time_to_first_batch_sec": round(first_batch, 3),
                     "loss": round(float(last_reduced[3].item()) / train_steps, 4),
                     "train_accuracy": round(float(last_reduced[1].item()) / seen, 4) if seen else 0,
+                    "history": history,
                     "classes": manifest["classes"],
                     "num_classes": num_classes,
                     "epochs": args.epochs,

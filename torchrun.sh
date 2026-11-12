@@ -18,10 +18,15 @@ fi
 
 export PYTHONPATH="/data/pydeps${PYTHONPATH:+:$PYTHONPATH}"
 PHASE="${2:-train}"
+METRICS_DIR="${METRICS_DIR:-/data/metrics}"
 if [[ "${PHASE}" == "eval" ]]; then
-  METRICS="/data/metrics/test-metrics.json"
+  METRICS="${METRICS_DIR}/test-metrics.json"
 else
-  METRICS="/data/metrics/train-metrics.json"
+  METRICS="${METRICS_DIR}/train-metrics.json"
+fi
+EPOCH_ARGS=()
+if [[ -n "${EPOCHS:-}" ]]; then
+  EPOCH_ARGS+=(--epochs "${EPOCHS}")
 fi
 exec torchrun \
   --nnodes="${NNODES}" \
@@ -32,4 +37,5 @@ exec torchrun \
   /data/code/train.py \
   --manifest "${1:-/data/shards/manifest.json}" \
   --phase "${PHASE}" \
-  --metrics "${METRICS}"
+  --metrics "${METRICS}" \
+  "${EPOCH_ARGS[@]}"
