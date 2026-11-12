@@ -17,6 +17,12 @@ if [[ -z "${MASTER_ADDR}" ]]; then
 fi
 
 export PYTHONPATH="/data/pydeps${PYTHONPATH:+:$PYTHONPATH}"
+PHASE="${2:-train}"
+if [[ "${PHASE}" == "eval" ]]; then
+  METRICS="/data/metrics/test-metrics.json"
+else
+  METRICS="/data/metrics/train-metrics.json"
+fi
 exec torchrun \
   --nnodes="${NNODES}" \
   --nproc-per-node="${NPROC}" \
@@ -24,4 +30,6 @@ exec torchrun \
   --master-addr="${MASTER_ADDR}" \
   --master-port="${MASTER_PORT}" \
   /data/code/train.py \
-  --shards "${1:-/data/shards}"
+  --manifest "${1:-/data/shards/manifest.json}" \
+  --phase "${PHASE}" \
+  --metrics "${METRICS}"
