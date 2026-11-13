@@ -96,8 +96,6 @@ def pack(split_path, shard_dir, manifest_path, images_per_shard=2000):
     test_samples = samples_from(split["test"])
     destination = Path(shard_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    for old in destination.glob("shard-*.tar"):
-        old.unlink()
     train = write_split(train_samples, destination / "train", images_per_shard)
     test = write_split(test_samples, destination / "test", images_per_shard)
     train_counts = count_classes(train_samples, classes)

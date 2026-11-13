@@ -350,12 +350,18 @@ def _write_one(task):
     render(class_id, class_id * 1_000_003 + index).save(path, format="JPEG", quality=85)
 
 
-def generate(count, output, workers=1):
+def generate(count, output, workers=1, replace=False):
     if count < 1:
         raise SystemExit("count must be at least 1")
     if workers < 1:
         raise SystemExit("workers must be at least 1")
     out = Path(output)
+    existing = count_images(out) if out.exists() else 0
+    if existing > count and not replace:
+        raise SystemExit(
+            f"{out} already has {existing} images. Refusing to shrink it to {count}. "
+            "Pass replace=True, or --replace on the command line, to delete the extras."
+        )
     out.mkdir(parents=True, exist_ok=True)
     stamp_path = out / "generator.txt"
     classes_path = out / "classes.txt"
@@ -399,11 +405,16 @@ def main():
     parser.add_argument("--count", type=int, default=20000)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Delete existing images when the folder already has more than --count",
+    )
+    parser.add_argument(
         "--output",
         default=os.environ.get("DATA_ROOT", "/opt/app-root/src/data") + "/raw",
     )
     args = parser.parse_args()
-    generate(args.count, args.output, args.workers)
+    generate(args.count, args.output, args.workers, replace=args.replace)
 
 
 if __name__ == "__main__":

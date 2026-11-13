@@ -28,7 +28,15 @@ EPOCH_ARGS=()
 if [[ -n "${EPOCHS:-}" ]]; then
   EPOCH_ARGS+=(--epochs "${EPOCHS}")
 fi
-exec torchrun \
+
+SAMPLER_PID=""
+if [[ "${LOCAL_RANK:-0}" == "0" && -f /data/code/gpu_sample.py ]]; then
+  GPU_SAMPLE_PHASE="${PHASE}" python /data/code/gpu_sample.py &
+  SAMPLER_PID=$!
+fi
+
+set +e
+torchrun \
   --nnodes="${NNODES}" \
   --nproc-per-node="${NPROC}" \
   --node-rank="${NODE_RANK}" \
@@ -39,3 +47,11 @@ exec torchrun \
   --phase "${PHASE}" \
   --metrics "${METRICS}" \
   "${EPOCH_ARGS[@]}"
+status=$?
+set -e
+
+if [[ -n "${SAMPLER_PID}" ]]; then
+  kill "${SAMPLER_PID}" >/dev/null 2>&1 || true
+  wait "${SAMPLER_PID}" >/dev/null 2>&1 || true
+fi
+exit "${status}"

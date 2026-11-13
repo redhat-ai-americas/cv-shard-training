@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import os
+import re
 import ssl
 import time
 import urllib.error
@@ -164,6 +166,58 @@ def wait_for_job(name, timeout_sec):
     raise SystemExit(f"TrainJob {name} did not finish within {timeout_sec}s")
 
 
+def gpu_metric_batch(metrics_dir, phase):
+    rows = []
+    pattern = re.compile(rf"gpu-{re.escape(phase)}-node-(\d+)")
+    for path in sorted(Path(metrics_dir).glob(f"gpu-{phase}-node-*.jsonl")):
+        match = pattern.fullmatch(path.stem)
+        if match is None:
+            continue
+        node = f"node_{match.group(1)}"
+        step_by_gpu = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            sample = json.loads(line)
+            gpu = int(sample["gpu"])
+            step = step_by_gpu.get(gpu, 0)
+            step_by_gpu[gpu] = step + 1
+            prefix = f"system/{node}/gpu_{gpu}_"
+            stamp = int(sample["timestamp"])
+            rows.append(
+                (prefix + "utilization_percentage", float(sample["utilization_percentage"]), stamp, step)
+            )
+            rows.append(
+                (prefix + "memory_usage_megabytes", float(sample["memory_usage_megabytes"]), stamp, step)
+            )
+    return rows
+
+
+def log_gpu_metrics(metrics_dir, phase):
+    run_id = os.environ.get("MLFLOW_RUN_ID", "")
+    try:
+        batch = gpu_metric_batch(metrics_dir, phase)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        print(f"gpu metrics unreadable: {error}", flush=True)
+        return
+    print(f"gpu_samples={len(batch)} mlflow_run_id_set={bool(run_id)}", flush=True)
+    if not run_id or not batch:
+        return
+    try:
+        import mlflow
+        from mlflow.entities import Metric
+
+        client = mlflow.MlflowClient()
+        for start in range(0, len(batch), 200):
+            metrics = [
+                Metric(key, value, stamp, step)
+                for key, value, stamp, step in batch[start : start + 200]
+            ]
+            client.log_batch(run_id=run_id, metrics=metrics)
+    except Exception as error:
+        print(f"gpu metrics logging failed: {error}", flush=True)
+
+
 def tail_rank0(name):
     prefix = f"{name}-node-0"
     for pod in matching_pods(name):
@@ -218,6 +272,7 @@ def submit(manifest_path, metrics_path, timeout_sec, phase, metrics_dir, checkpo
     target.write_text(metrics_file.read_text(encoding="utf-8"), encoding="utf-8")
     print(metrics_file.read_text(encoding="utf-8"), flush=True)
     print(f"trainjob={name}", flush=True)
+    log_gpu_metrics(metrics_dir, phase)
 
 
 def main():

@@ -112,6 +112,69 @@ def reduce_stats(device, images, correct, steps, total_loss):
     return reduced
 
 
+def add_confusion(matrix, labels, predictions):
+    num_classes = matrix.shape[0]
+    labels = labels.detach().reshape(-1).to(dtype=torch.int64).cpu()
+    predictions = predictions.detach().reshape(-1).to(dtype=torch.int64).cpu()
+    indices = labels * num_classes + predictions
+    counts = torch.bincount(indices, minlength=num_classes * num_classes)
+    matrix += counts.reshape(num_classes, num_classes)
+
+
+def score_counts(counts, classes):
+    raw = []
+    total = 0
+    correct = 0
+    for index, name in enumerate(classes):
+        true_positive = int(counts[index][index])
+        support = int(sum(counts[index]))
+        predicted = int(sum(row[index] for row in counts))
+        precision = true_positive / predicted if predicted else 0.0
+        recall = true_positive / support if support else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
+        raw.append((name, precision, recall, f1, support))
+        total += support
+        correct += true_positive
+    per_class = [
+        {
+            "class": name,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "support": support,
+        }
+        for name, precision, recall, f1, support in raw
+    ]
+
+    def macro(field):
+        if not raw:
+            return 0.0
+        return round(sum(item[field] for item in raw) / len(raw), 4)
+
+    def weighted(field):
+        if not total:
+            return 0.0
+        return round(sum(item[field] * item[4] for item in raw) / total, 4)
+
+    return {
+        "confusion_matrix": [[int(value) for value in row] for row in counts],
+        "per_class": per_class,
+        "accuracy": round(correct / total, 4) if total else 0.0,
+        "precision_macro": macro(1),
+        "recall_macro": macro(2),
+        "f1_macro": macro(3),
+        "precision_weighted": weighted(1),
+        "recall_weighted": weighted(2),
+        "f1_weighted": weighted(3),
+    }
+
+
+def reduced_scores(matrix, device, classes):
+    reduced = matrix.to(device=device, dtype=torch.float64)
+    dist.all_reduce(reduced)
+    return score_counts(reduced.detach().cpu().tolist(), classes)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
@@ -154,12 +217,14 @@ def main():
         first_batch = None
         total_images = 0.0
         last_reduced = None
+        last_scores = None
         history = []
         for epoch in range(args.epochs):
             images = 0
             correct = 0
             total_loss = 0.0
             steps = 0
+            matrix = torch.zeros((num_classes, num_classes), dtype=torch.int64)
             for images_batch, labels in loader:
                 if first_batch is None:
                     first_batch = time.perf_counter() - started
@@ -172,20 +237,24 @@ def main():
                 loss = loss_fn(logits, labels)
                 loss.backward()
                 optimizer.step()
+                predicted = logits.argmax(dim=1)
                 images += images_batch.size(0)
-                correct += (logits.argmax(dim=1) == labels).sum().item()
+                correct += (predicted == labels).sum().item()
                 total_loss += float(loss.item())
                 steps += 1
+                add_confusion(matrix, labels, predicted)
             last_reduced = reduce_stats(device, images, correct, steps, total_loss)
+            scores = reduced_scores(matrix, device, manifest["classes"])
             total_images += float(last_reduced[0].item())
             if rank == 0:
                 seen = float(last_reduced[0].item())
                 epoch_steps = max(int(last_reduced[2].item()), 1)
                 epoch_loss = float(last_reduced[3].item()) / epoch_steps
                 epoch_accuracy = float(last_reduced[1].item()) / seen if seen else 0
+                last_scores = scores
                 print(
                     f"epoch={epoch + 1}/{args.epochs} loss={epoch_loss:.4f} "
-                    f"accuracy={epoch_accuracy:.4f}",
+                    f"accuracy={epoch_accuracy:.4f} f1_macro={scores['f1_macro']:.4f}",
                     flush=True,
                 )
                 history.append(
@@ -193,6 +262,10 @@ def main():
                         "epoch": epoch + 1,
                         "loss": round(epoch_loss, 4),
                         "accuracy": round(epoch_accuracy, 4),
+                        "precision_macro": scores["precision_macro"],
+                        "recall_macro": scores["recall_macro"],
+                        "f1_macro": scores["f1_macro"],
+                        "per_class": scores["per_class"],
                     }
                 )
         if first_batch is None:
@@ -215,6 +288,14 @@ def main():
                     "time_to_first_batch_sec": round(first_batch, 3),
                     "loss": round(float(last_reduced[3].item()) / train_steps, 4),
                     "train_accuracy": round(float(last_reduced[1].item()) / seen, 4) if seen else 0,
+                    "precision_macro": last_scores["precision_macro"],
+                    "recall_macro": last_scores["recall_macro"],
+                    "f1_macro": last_scores["f1_macro"],
+                    "precision_weighted": last_scores["precision_weighted"],
+                    "recall_weighted": last_scores["recall_weighted"],
+                    "f1_weighted": last_scores["f1_weighted"],
+                    "per_class": last_scores["per_class"],
+                    "confusion_matrix": last_scores["confusion_matrix"],
                     "history": history,
                     "classes": manifest["classes"],
                     "num_classes": num_classes,
@@ -242,6 +323,7 @@ def main():
         correct = 0
         total_loss = 0.0
         steps = 0
+        matrix = torch.zeros((num_classes, num_classes), dtype=torch.int64)
         started = time.perf_counter()
         with torch.no_grad():
             for images_batch, labels in loader:
@@ -249,12 +331,15 @@ def main():
                 labels = labels.to(device, non_blocking=True)
                 logits = model(images_batch)
                 loss = loss_fn(logits, labels)
+                predicted = logits.argmax(dim=1)
                 images += images_batch.size(0)
-                correct += (logits.argmax(dim=1) == labels).sum().item()
+                correct += (predicted == labels).sum().item()
                 total_loss += float(loss.item())
                 steps += 1
+                add_confusion(matrix, labels, predicted)
         elapsed = time.perf_counter() - started
         reduced = reduce_stats(device, images, correct, steps, total_loss)
+        scores = reduced_scores(matrix, device, manifest["classes"])
         del loader
         if rank == 0:
             seen = float(reduced[0].item())
@@ -269,6 +354,14 @@ def main():
                     "test_seconds": round(elapsed, 3),
                     "test_loss": round(float(reduced[3].item()) / scored_steps, 4),
                     "test_accuracy": round(float(reduced[1].item()) / seen, 4) if seen else 0,
+                    "precision_macro": scores["precision_macro"],
+                    "recall_macro": scores["recall_macro"],
+                    "f1_macro": scores["f1_macro"],
+                    "precision_weighted": scores["precision_weighted"],
+                    "recall_weighted": scores["recall_weighted"],
+                    "f1_weighted": scores["f1_weighted"],
+                    "per_class": scores["per_class"],
+                    "confusion_matrix": scores["confusion_matrix"],
                     "classes": manifest["classes"],
                     "num_classes": num_classes,
                     "checkpoint": CHECKPOINT,
