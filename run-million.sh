@@ -1,6 +1,6 @@
 #!/bin/bash
-# Regenerates the million-image corpus under /data/raw, then runs the pipeline
-# defaults: every image, one epoch, shards rewritten under /data/shards.
+# Draws one million images under /data/raw, then runs the pipeline
+# defaults: every image, one epoch, shards written under /data/shards.
 # Pack deletes shard-*.tar inside that directory's train/ and test/ folders.
 # The finished ten-epoch fit is documented in scaling-to-one-million.md.
 set -euo pipefail

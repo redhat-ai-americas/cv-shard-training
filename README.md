@@ -1,60 +1,128 @@
 # CV shard training
 
-OpenShift AI 3.5 demo of an overhead image classifier. A workbench draws synthetic 256×256 JPEGs of trucks, boats, planes, and buildings. A pipeline then splits that corpus, packs it into WebDataset shards, trains ResNet18 on two GPUs, and scores the held-out shards. Metrics, a confusion matrix, and GPU utilization land in MLflow.
+A repeatable OpenShift AI 3.5 demo for a problem customers hit when training on a large set of small files. The story is an overhead image classifier with four classes: truck, boat, plane, building. The workbench draws the JPEGs. A pipeline packs them into WebDataset shards, trains ResNet18 on two GPUs, and scores the held-out set. MLflow keeps the epoch scores, a confusion matrix, and GPU utilization.
 
-The defaults are 20,000 images and one epoch. That is a time choice, not a limit of the model. A million-image, ten-epoch run on this pattern trained at about the same 1,800 images per second. Reading the million individual files into shards took about 2 hours 15 minutes and used no GPU. The fit itself took about 75 minutes, with both GPUs mostly busy. [scaling-to-one-million.md](scaling-to-one-million.md) records that run.
+Many small files make the GPUs wait. Each training step then pays for a separate open, read, and close. This demo does that work once, while packing, and the training loop reads large shard files instead. On a two-GPU sandbox the training rate stayed near 1,800 images per second from 20,000 images to 1,000,000.
 
-This is the path a customer follows, from an empty project to a scored model. The manifests match one sandbox. Change the settings in the next section before applying them anywhere else.
+Start with the 20,000-image path below. It is the same code as the million-image path. [scaling-to-one-million.md](scaling-to-one-million.md) is the longer run: how to draw the million images, where they land, and how long each stage took on this setup.
 
-## What the cluster must already have
+## Architecture
 
-OpenShift AI 3.5, with these platform pieces turned on:
+The workbench draws images onto a shared volume. The pipeline never draws, and it does not hold the GPUs. Each training step submits a Kubeflow Trainer v2 TrainJob and waits. Two nodes, one GPU each, run `train.py` with torchrun. Rank 0 writes the checkpoint and a JSON report. The pipeline task reads that JSON and publishes metrics.
 
-- The MLflow Operator component, and an `mlflow` custom resource. A small install uses SQLite and a volume for artifacts. See [Install and configure MLflow](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_mlflow/installing-mlflow_mlflow).
-- Data science pipelines, so a project can create a pipeline server.
-- A Kubeflow Trainer v2 `ClusterTrainingRuntime` named `torch-distributed-cuda130-torch211-py312`. TrainJobs use that runtime. See [Run Kubeflow Trainer v2 workloads](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_distributed_workloads/running-kubeflow-trainerv2_distributed-workloads).
-- At least two GPU nodes, and an RWX storage class for the shared data volume.
-- A hardware profile the workbench can use. This sandbox uses `large-cpu-profile` in `redhat-ods-applications`.
+```mermaid
+flowchart LR
+  wb[Workbench] --> raw["/data/raw JPEGs"]
+  raw --> split[split-dataset]
+  split --> pack[pack-shards]
+  pack --> shards["/data/shards"]
+  shards --> train[TrainJob]
+  train --> ckpt[Checkpoint]
+  ckpt --> evaluate[Eval TrainJob]
+  shards --> evaluate
+  train --> mlflow[Nested MLflow runs]
+  evaluate --> mlflow
+```
 
-The demo does not call MaaS, and it does not put the project under Kueue. The checkpoint stays on the shared volume. Registering it in the model registry is later work.
+MLflow creates one nested run per pipeline step. The parent run stays empty. Open the nested `train` run and the nested `evaluate` run.
 
-## Settings to change on another cluster
+The training pods do not call MLflow. They have the GPUs and no MLflow credentials. `gpu_sample.py` appends `nvidia-smi` samples on those pods. After the TrainJob finishes, the pipeline task logs them on the nested run under the `system/` names MLflow shows as System metrics.
 
-| Setting | Where | This sandbox |
+## What you install, and what this repo adds
+
+You bring the platform. Nothing in this repo installs OpenShift, the OpenShift AI operator, the MLflow operator, the GPU operator, a storage class, or a Trainer runtime.
+
+The manifests add only the project resources for the demo:
+
+| Manifest | What it creates |
+| --- | --- |
+| `manifests/namespace.yaml` | Project `cv-shard-training`, visible on the dashboard |
+| `manifests/pvc.yaml` | Workbench home volume and the shared data volume |
+| `manifests/workbench.yaml` | Jupyter workbench on the PyTorch 3.5 image |
+| `manifests/workflow-controller-config.yaml` | Pipeline artifact store and the CA the workflow controller trusts |
+| `manifests/dspa.yaml` | Pipeline server: API, MariaDB, and the workflow controller |
+| `manifests/pipeline-rbac.yaml` | Lets the workbench start runs, and lets the pipeline create TrainJobs |
+
+After the pipeline server is up, turn on **Allow pipeline tasks to log directly to MLflow** in the dashboard. That checkbox is not in the manifest. On a server that is already running, do not full-apply `dspa.yaml`. The file is the starting spec, and a live server may have gained fields since.
+
+## Prerequisites
+
+OpenShift AI 3.5, with a cluster admin having already enabled:
+
+- The MLflow operator and an `mlflow` custom resource. A small server uses SQLite and a volume for artifacts. [Install and configure MLflow](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_mlflow/installing-mlflow_mlflow).
+- Data science pipelines, so the project can own a pipeline server.
+- A Kubeflow Trainer v2 cluster runtime named `torch-distributed-cuda130-torch211-py312`. [Run TrainJobs](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_distributed_workloads/running-kubeflow-trainerv2_distributed-workloads).
+- Two GPU nodes. The TrainJob asks for one GPU on each of two nodes.
+- An RWX storage class for the shared data volume, and an RWO class for the workbench disk and the pipeline database. The manifests use `efs-csi` and `gp3-csi`.
+- A hardware profile for the workbench. The manifest selects `large-cpu-profile` in `redhat-ods-applications`.
+- An S3 bucket for pipeline artifacts, and keys you can put in a secret. The bucket is separate from the MLflow artifact store.
+
+You also need `oc` logged into the cluster, and permission to create the project.
+
+The demo does not use MaaS or Kueue. The checkpoint stays on the shared volume.
+
+## Configuration
+
+Values in the repo match one sandbox. Change them before applying the manifests on another cluster. Names that include the project, such as the notebook base URL and `PIPELINE_HOST`, have to move together.
+
+| Setting | Change it in | Sandbox value | On another cluster |
+| --- | --- | --- | --- |
+| Project | every manifest, and `pipeline.py` `NAMESPACE` | `cv-shard-training` | Your project name |
+| Shared data volume | `manifests/pvc.yaml` `cv-data` | `efs-csi`, 100Gi, ReadWriteMany | Your RWX class. 100Gi holds the million-image set |
+| Workbench disk | `manifests/pvc.yaml` `cv-workbench` | `gp3-csi`, 20Gi | Your RWO class |
+| Pipeline database | `manifests/dspa.yaml` | `gp3-csi`, 10Gi MariaDB | Your RWO class |
+| S3 bucket, region, host | `manifests/dspa.yaml` and `manifests/workflow-controller-config.yaml` | `cv-shard-pipelines-9j696` in `us-east-2` | Your bucket |
+| S3 keys | secret `aws-s3-pipelines` | not in git | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| Dashboard host | `pipeline.py` `DASHBOARD`, `manifests/workbench.yaml` `MLFLOW_TRACKING_URI` | `rh-ai.apps.ocp.9j696.sandbox5421.opentlc.com` | Your OpenShift AI route |
+| Pipeline API | `pipeline.py` `PIPELINE_HOST` | `ds-pipeline-dspa.cv-shard-training.svc.cluster.local:8443` | Same service name in your project |
+| Workbench image and size | `manifests/workbench.yaml` | PyTorch 3.5, 2 CPU, 8Gi | Keep a 3.5 image that includes PyTorch and MLflow |
+| Trainer runtime | `submit_trainjob.py` `RUNTIME` | `torch-distributed-cuda130-torch211-py312` | A CUDA TrainJob runtime that exists on the cluster |
+| GPUs | `submit_trainjob.py` `build_train_job` | 2 nodes, 1 GPU, 4 CPU, 24Gi each | Match the nodes you have |
+| Pipeline task image | `pipeline.py` `BASE_IMAGE` | `s2i-generic-data-science-notebook:3.5` | The 3.5 data science notebook image |
+| Pipeline version | `pipeline.py` `VERSION_NAME` | `v2` | A new name each time the graph changes. Versions are immutable |
+
+`pipeline.py` uses `verify_ssl=False` when it talks to the in-cluster pipeline API from the workbench. The workflow controller still needs the cluster CA, which is `SSL_CERT_FILE=/kfp/certs/ca.crt` in the workflow ConfigMap. Apply that ConfigMap before `dspa.yaml`. Leave the generated ConfigMap `ds-pipeline-workflow-controller-dspa` alone. The operator replaces it.
+
+Training knobs you can change without editing manifests:
+
+| Knob | Default | Where |
 | --- | --- | --- |
-| Project | `manifests/namespace.yaml` | `cv-shard-training` |
-| Shared volume class and size | `manifests/pvc.yaml` `cv-data` | `efs-csi`, 100Gi, ReadWriteMany |
-| Workbench volume class and size | `manifests/pvc.yaml` `cv-workbench` | `gp3-csi`, 20Gi, ReadWriteOnce |
-| Pipeline database class | `manifests/dspa.yaml` | `gp3-csi`, 10Gi MariaDB |
-| S3 bucket, region, host | `manifests/dspa.yaml` and `manifests/workflow-controller-config.yaml` | `cv-shard-pipelines-9j696`, `us-east-2` |
-| S3 credentials | secret `aws-s3-pipelines`, keys `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` | Not in git |
-| Dashboard host | `pipeline.py` `DASHBOARD`, and `manifests/workbench.yaml` `MLFLOW_TRACKING_URI` | `rh-ai.apps.ocp.9j696.sandbox5421.opentlc.com` |
-| Pipeline API | `pipeline.py` `PIPELINE_HOST` | `https://ds-pipeline-dspa.cv-shard-training.svc.cluster.local:8443` |
-| Workbench image | `manifests/workbench.yaml` | `pytorch:3.5` from the OpenShift AI image registry |
-| Workbench size | `manifests/workbench.yaml` | 2 CPU, 8Gi. The notebook URL path includes the project and workbench name |
-| Trainer runtime | `submit_trainjob.py` `RUNTIME` | `torch-distributed-cuda130-torch211-py312` |
-| TrainJob shape | `submit_trainjob.py` `build_train_job` | 2 nodes, 1 GPU, 4 CPU, and 24Gi each |
-| Pipeline task image | `pipeline.py` `BASE_IMAGE` | `s2i-generic-data-science-notebook:3.5` |
-| Pipeline version | `pipeline.py` `VERSION_NAME` | `v2`. A version cannot be edited. The next graph change needs `v3` |
+| Images | 20,000 in the notebook. `0` in the pipeline means every JPEG under the raw directory | `demo.ipynb`, `pipeline.py --max-per-class` |
+| Classes and image size | four classes, 256×256 JPEG | `generate_images.py` |
+| Split | 80/20, seed 17 | `split_dataset.py` |
+| Images per shard | 2,000 | `pack_shards.py` |
+| Epochs | 1 | `pipeline.py --epochs` |
+| Batch, workers, learning rate | 128, 2 workers per GPU, 0.05 | `train.py` |
+| Model | ResNet18 from scratch | `train.py` |
+| Train wait | 3,600 seconds | `submit_trainjob.py` `TIMEOUT_SEC` |
 
-`pipeline.py` sets `verify_ssl=False` for the in-cluster pipeline API. The workflow controller still needs the cluster CA. That is the `SSL_CERT_FILE=/kfp/certs/ca.crt` entry in `manifests/workflow-controller-config.yaml`. Apply that ConfigMap before the pipeline server. Do not edit the generated ConfigMap `ds-pipeline-workflow-controller-dspa`. The operator replaces it.
+Shard shuffle stays off so both ranks see the same shard list. `split_by_node` divides that list across the two GPUs.
 
-## Dependencies
+## Dependencies the demo installs
 
-The workbench image already includes Python 3.12, PyTorch, Pillow, NumPy, matplotlib, and MLflow. Starting with OpenShift AI 3.4, the standard workbench images include the MLflow SDK. The pipeline task image includes MLflow and matplotlib as well. This repo adds only what those images do not carry.
+The workbench image already has Python 3.12, PyTorch, Pillow, NumPy, matplotlib, and MLflow. The pipeline task image has MLflow and matplotlib. The Trainer image has CUDA, PyTorch, and `nvidia-smi`.
 
-| Package | Where it is installed | Pin |
+You install two things the images do not carry:
+
+| Package | When | Pin |
 | --- | --- | --- |
-| `kfp` | Workbench, by the last notebook cell, from `https://pypi.org/simple` | `2.17.0` |
-| `webdataset` and `braceexpand` | Shared volume `/data/pydeps`, imported by the TrainJob through `PYTHONPATH` | `webdataset==0.2.100` |
-| CUDA, PyTorch, `nvidia-smi` | The Trainer runtime image | The runtime named above |
+| `kfp` | Last cell of `demo.ipynb`, from PyPI | `2.17.0` |
+| `webdataset` and `braceexpand` | Once, onto the shared volume at `/data/pydeps` | `webdataset==0.2.100` |
 
-No other pip installs are required. Do not commit a virtualenv or the compiled pipeline YAML. `.gitignore` already excludes `cv_shard_pipeline.yaml`.
+The TrainJob imports WebDataset from `/data/pydeps`. It does not use the workbench site-packages.
 
-## From an empty project to a scored model
+## Run the 20,000-image demo
 
-1. Create secret `aws-s3-pipelines` in the project. Do not commit it.
-2. Apply the manifests in this order: `namespace.yaml`, `pvc.yaml`, `workbench.yaml`, `workflow-controller-config.yaml`, `dspa.yaml`, `pipeline-rbac.yaml`.
+1. Create the artifact secret in the project. Do not commit it.
+
+   ```bash
+   oc create secret generic aws-s3-pipelines \
+     --from-literal=AWS_ACCESS_KEY_ID=YOUR_KEY \
+     --from-literal=AWS_SECRET_ACCESS_KEY=YOUR_SECRET \
+     -n cv-shard-training
+   ```
+
+2. Apply the manifests in order.
 
    ```bash
    oc apply -f manifests/namespace.yaml
@@ -65,103 +133,130 @@ No other pip installs are required. Do not commit a virtualenv or the compiled p
    oc apply -f manifests/pipeline-rbac.yaml
    ```
 
-   Leave `integrationMode` unset so MLflow autodetects. Do not full-apply `dspa.yaml` over a pipeline server that is already running. The file does not contain every field the live server may have grown.
-3. In the dashboard, open the project, then **Manage pipeline server → Advanced settings**, and turn on **Allow pipeline tasks to log directly to MLflow**. That is `injectUserEnvVars`. The pipeline driver creates one nested MLflow run per step and injects `MLFLOW_TRACKING_URI`, `MLFLOW_RUN_ID`, and the workspace into that step. The task code logs into that run. It does not call `mlflow.start_run()`.
-4. Open the workbench **CV shard training**. The `opendatahub.io/mlflow-instance: mlflow` annotation is what OpenShift AI uses to inject MLflow into a workbench. See [Track experiments with MLflow in workbenches](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_mlflow/tracking-experiments-with-mlflow-in-workbenches). Dashboard login sits in front of the notebook. The empty notebook token in the manifest is the usual workbench setting, not an extra password.
-5. Put this repo in the workbench home, `/opt/app-root/src`. The shared volume `cv-data` is `/opt/app-root/src/data` in the workbench and `/data` on the pipeline and training pods.
-6. Copy the scripts the pods actually run. Editing the git checkout is not enough.
+3. Wait until the workbench and the pipeline server are ready. In the dashboard open the project, then **Manage pipeline server → Advanced settings**, and turn on **Allow pipeline tasks to log directly to MLflow**.
+4. Open the workbench **CV shard training**. Clone this repo into `/opt/app-root/src`. The shared volume is `/opt/app-root/src/data` there, and `/data` on the pipeline and training pods.
+5. Copy the scripts the pods run, and install WebDataset. Editing the git checkout is not enough. The pods read `/data/code`.
 
    ```bash
    mkdir -p /opt/app-root/src/data/code
    cp split_dataset.py pack_shards.py train.py submit_trainjob.py gpu_sample.py torchrun.sh \
      /opt/app-root/src/data/code/
-   ```
-
-7. Install WebDataset onto the shared volume. The workbench pip index does not carry it.
-
-   ```bash
    pip install --index-url https://pypi.org/simple \
      --target /opt/app-root/src/data/pydeps --no-deps \
      webdataset==0.2.100 braceexpand
    ```
 
-8. Run `demo.ipynb` from the top.
-   - The first code cell writes 20,000 JPEGs under `/data/raw`, 5,000 of each class. The generator stamp is `overhead-silhouettes-v1`. A later run with the same stamp fills gaps. If the folder already has more than 20,000 images, the cell stops. Shrinking it requires `generate(..., replace=True)` or `python generate_images.py --count 20000 --replace`.
+6. Run `demo.ipynb` from the top.
+   - The first cell draws 20,000 JPEGs, 5,000 of each class, under `/opt/app-root/src/data/raw`. With one worker on this workbench that takes a few minutes. The generator stamp is `overhead-silhouettes-v1`. A later run with the same stamp fills gaps. If the folder already has more images than you asked for, the cell stops. Pass `--replace` only when you mean to delete the extras.
    - The next cell shows a 4×4 preview.
-   - The last cell installs `kfp` and calls `submit()`. That registers pipeline `overhead-shard-training` version `v2` if needed, then starts a run with the defaults: every image in `/data/raw`, one epoch, shards under `/data/shards`, metrics under `/data/metrics`, checkpoint `/data/models/resnet18.pt`.
-9. Open **Develop and train → Pipelines**. The run has four steps: `split-dataset`, `pack-shards`, `train`, `evaluate`. Pack deletes `shard-*.tar` inside `<shard_dir>/train` and `<shard_dir>/test` before it writes the new shards. A subset run must pass a different shard directory, metrics directory, and checkpoint. `pipeline.py` refuses a subset that targets the default paths.
+   - The last cell installs `kfp` and starts the pipeline. Defaults: every image currently in `/data/raw`, one epoch, shards in `/data/shards`, metrics in `/data/metrics`, checkpoint `/data/models/resnet18.pt`.
 
-   ```bash
-   python pipeline.py \
-     --max-per-class 5000 \
-     --epochs 3 \
-     --shard-dir /data/subset-20k/shards \
-     --metrics-dir /data/subset-20k/metrics \
-     --checkpoint /data/subset-20k/models/resnet18.pt
-   ```
+7. Open **Develop and train → Pipelines**. The run is `overhead-shard-training`, version `v2`, with steps `split-dataset`, `pack-shards`, `train`, and `evaluate`. On this setup a 20,000-image, one-epoch run finishes in well under half an hour. Most of that is scheduling the two GPU pods. The fit itself is under a minute.
+8. Open **Develop and train → Experiments (MLflow)** and the experiment `overhead-shard-training`. Read the nested train run and the nested evaluate run.
 
-   `--max-per-class 5000` keeps the first 5,000 JPEGs of each class, 20,000 images in total. `0` means every image.
-10. Open **Develop and train → Experiments (MLflow)**, experiment `overhead-shard-training`. The parent run is empty. Open the nested run for `train` and the nested run for `evaluate`.
+Pack deletes existing `shard-*.tar` files inside `<shard_dir>/train` and `<shard_dir>/test` before it writes new ones. A trial that must leave the main shards alone uses its own directories. `pipeline.py` refuses a subset that still points at `/data/shards`, `/data/metrics`, or the default checkpoint.
 
-`run-million.sh` is the unattended form of the full corpus: it generates 1,000,000 images and then runs `pipeline.py` with the defaults, including one epoch and a rewrite of `/data/shards`. It is not the ten-epoch fit. Use the scaling note for that.
+```bash
+python pipeline.py \
+  --max-per-class 5000 \
+  --epochs 3 \
+  --shard-dir /data/subset-20k/shards \
+  --metrics-dir /data/subset-20k/metrics \
+  --checkpoint /data/subset-20k/models/resnet18.pt
+```
 
-## What a successful run records
+`--max-per-class 5000` keeps the first 5,000 JPEGs of each class, which is 20,000 images. `--max-per-class 0` uses every JPEG in the raw directory.
 
-The train curve is the training set, one point per epoch. The confusion matrix and the `test_*` scores are the held-out 20 percent. Rows of the matrix are the true class, columns are the predicted class, in the order `truck`, `boat`, `plane`, `building`.
+## Where the files go
 
-| Step | What shows up |
+Paths below are what the pipeline and the TrainJobs see. In the workbench, prefix them with `/opt/app-root/src`.
+
+| Path | Contents |
+| --- | --- |
+| `/data/raw/<class>/000000.jpg` | Generated JPEGs. Also `classes.txt` and `generator.txt` |
+| `/data/splits/split.json` | The 80/20 list. A custom shard dir uses `<shard_dir>/../splits/split.json` |
+| `/data/shards/train`, `/data/shards/test` | WebDataset tarballs, 2,000 images each, plus `manifest.json` |
+| `/data/metrics/train-metrics.json` | Epoch history, confusion counts, images per second |
+| `/data/metrics/test-metrics.json` | Held-out scores and the confusion matrix |
+| `/data/models/resnet18.pt` | Checkpoint written by rank 0 |
+| `/data/code` | The copies of the scripts the pods execute |
+| `/data/pydeps` | WebDataset |
+
+A 20,000-image corpus is about 205MB of JPEGs and about 196MB of shards. A million images, shards included, is about 20GB. The 100Gi shared volume has room for that.
+
+## What a successful run shows
+
+The train curve is the training set, one point per epoch. The confusion matrix and the `test_*` scores are the held-out 20 percent. Matrix rows are the true class and columns are the predicted class, in the order truck, boat, plane, building.
+
+| Step | Metrics |
 | --- | --- |
 | `split-dataset` | `train_count`, `test_count` |
 | `pack-shards` | `image_count`, `train_shards`, `test_shards` |
-| `train` | One point per epoch for `loss`, `train_accuracy`, macro precision, recall, and F1, and the same three scores per class. `images_per_sec` is the whole fit. System metrics hold `system/node_<n>/gpu_<i>_utilization_percentage` and `system/node_<n>/gpu_<i>_memory_usage_megabytes`. |
-| `evaluate` | `test_loss`, `test_accuracy`, `test_images`, macro and weighted precision, recall, and F1, per-class precision, recall, F1, and support, and one `test_cm_<true>_<predicted>` count per cell. Artifacts `confusion_matrix.png`, `confusion_matrix.json`, and `confusion_matrix.txt` are on the nested run when direct MLflow logging is on. The eval TrainJob records the same GPU series. Eval is often shorter than the 15 second sample interval, so that series can be a single startup point. |
+| `train` | `loss`, `train_accuracy`, macro and per-class precision, recall, and F1, once per epoch. `images_per_sec` covers the whole fit. System metrics: `system/node_<n>/gpu_<i>_utilization_percentage` and `system/node_<n>/gpu_<i>_memory_usage_megabytes` |
+| `evaluate` | `test_loss`, `test_accuracy`, `test_images`, macro and weighted precision, recall, and F1, per-class scores and support, and one `test_cm_<true>_<predicted>` count per cell. Also `confusion_matrix.png`, `.json`, and `.txt` |
 
-Scalar `test_*` metrics also go through `metrics.log_metric`, which the platform copies even when the checkbox is off. The epoch curve, the matrix image, and the GPU series need the checkbox. A missing `nvidia-smi`, or a failed MLflow write of the GPU series or the matrix image, is printed and does not fail the step.
+The platform copies ordinary `metrics.log_metric` scalars even when the MLflow checkbox is off. The epoch curve, the matrix image, and the GPU series need the checkbox. The task logs into the run the driver already created. It does not call `mlflow.start_run()`.
 
-GPU samples are taken on the training pods. Those pods do not call MLflow. The Trainer service account has no MLflow role, and turning on MLflow's own system sampler inside the pipeline task would record the idle orchestrator, which has no GPU. `gpu_sample.py` runs `nvidia-smi` every 15 seconds. After the TrainJob finishes, `submit_trainjob.py` logs the samples on the nested run with the `system/` names MLflow groups as System metrics.
+On a two-GPU check with 20,000 images and three epochs, one GPU reached 99 percent utilization and the other 82 percent, both holding about 7,043 MB. A one-epoch pass on 20,000 easy drawings lands near 0.77 train accuracy and 0.83 test accuracy. More epochs on the same drawings climb toward 1.0. That score is the synthetic shapes, not a leaked split.
 
-On the 20,000-image check, one GPU reached 99 percent and the other 82 percent, both holding about 7,043 MB. On the million-image fit, the minute-by-minute medians were about 91 percent and 86 percent, memory stayed near 7,042 MB, and throughput stayed at about 1,793 images per second. The dips in that chart are one-minute samples of a small 256×256 batch, shard reads, and the two GPUs waiting on each other. They are not the flat idle line of a loader that opens a million objects during training.
+GPU samples arrive every 15 seconds. An eval job shorter than that interval often keeps only the startup sample. A missing `nvidia-smi`, or a failed write of the GPU series or the matrix image, is printed and does not fail the step.
 
-## Training defaults
+## One million images
 
-| Knob | Value | Where |
-| --- | --- | --- |
-| Classes | truck, boat, plane, building | `generate_images.py` `CLASSES` |
-| Image size | 256×256 JPEG, quality 85 | `generate_images.py` |
-| Split | 80/20, seed 17 | `split_dataset.py` |
-| Images per shard | 2,000 | `pack_shards.py` |
-| Epochs | 1, unless the run passes `--epochs` | `train.py`, `pipeline.py` |
-| Batch size | 128 | `train.py` |
-| Loader workers | 2 per GPU | `train.py` |
-| Learning rate | 0.05 | `train.py` |
-| Model | ResNet18, trained from scratch | `train.py` |
-| Checkpoint | `/data/models/resnet18.pt` | Rank 0 |
-| Train wait | 3,600 seconds | `submit_trainjob.py` `TIMEOUT_SEC` |
+Draw the corpus yourself. It is not in the git repo, and a fresh cluster does not have it.
 
-Shard shuffle is off. Each rank must see the same shard list. `split_by_node` divides it across the two GPUs.
+On the workbench, with 2 CPUs and 2 worker processes, drawing runs at about 70 images a second onto the shared volume. Pillow does the drawing, so a GPU does not speed it up. One million images is about four hours. Twenty thousand images at that rate is about five minutes. Leave the workbench at 2 CPU unless you have measured a larger size. Generation writes:
 
-## What is included
+```text
+/opt/app-root/src/data/raw/{truck,boat,plane,building}/000000.jpg
+```
+
+That is 250,000 files per class. The same files are `/data/raw` for the pipeline.
+
+```bash
+python -u generate_images.py --count 1000000 --workers 2 \
+  --output /opt/app-root/src/data/raw
+```
+
+`run-million.sh` runs that command and then starts the pipeline at the default of one epoch. The comparison we measured used ten epochs. Raise `TIMEOUT_SEC` in `submit_trainjob.py` to at least 10800 before that fit, copy the file to `/data/code`, and start the run with `--epochs 10`. The default wait of one hour is shorter than the ten-epoch fit.
+
+Measured on this two-GPU sandbox, after the JPEGs were already drawn:
+
+| Stage | Time |
+| --- | --- |
+| Split | about 2 minutes |
+| Pack one million JPEGs into 400 train shards and 100 test shards | 2 hours 15 minutes |
+| Train, 10 epochs, 800,000 images per epoch | 75 minutes, about 1,800 images per second |
+| Evaluate 200,000 images | about 2 minutes |
+
+Plan on an afternoon for drawing and another afternoon for pack plus training, or leave the chain overnight. GPU utilization across that 75-minute fit sat at a median of about 91 percent and 86 percent, with memory near 7,042 MB. The same images per second as the 20,000-image run is the result to show: once the bytes are in shards, a million files does not slow the fit down. The expensive part was reading each JPEG during pack, while the GPUs were idle.
+
+Full commands, the ten-epoch accuracy, and a 100,000-image trial are in [scaling-to-one-million.md](scaling-to-one-million.md).
+
+## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| `demo.ipynb` | Generate the images, show a preview, launch the default pipeline run |
-| `generate_images.py` | Draw the labeled JPEGs. Default count is 20,000 |
-| `split_dataset.py` | Stratified split, as a JSON list the pack step consumes |
-| `pack_shards.py` | Pack that split into train and test shards and write the manifest |
-| `train.py` | ResNet18. `--phase train` fits and saves the checkpoint. `--phase eval` scores the test shards |
-| `submit_trainjob.py` | Create one TrainJob, wait for it, and log its GPU samples |
-| `gpu_sample.py` | Sample `nvidia-smi` on each training pod until that pod exits |
-| `torchrun.sh` | Launch `train.py` with the `PET_*` values the Trainer runtime injects |
-| `pipeline.py` | Register the pipeline version, if needed, and start a run |
-| `run-million.sh` | Generate 1,000,000 images and start the default one-epoch pipeline |
-| `tests/test_handoff.py` | Guard and metric-name checks. No GPU and no cluster |
-| `scaling-to-one-million.md` | The million-image result and the knobs for another one |
-| `manifests/` | Project, volumes, workbench, pipeline server, workflow CA, and TrainJob RBAC |
+| `demo.ipynb` | Draw 20,000 images, preview them, start the default pipeline |
+| `generate_images.py` | Draw the labeled JPEGs |
+| `split_dataset.py` | Stratified 80/20 split |
+| `pack_shards.py` | Pack the split into train and test shards |
+| `train.py` | Train or evaluate ResNet18 |
+| `submit_trainjob.py` | Create a TrainJob, wait, and log GPU samples |
+| `gpu_sample.py` | Sample `nvidia-smi` until the training pod exits |
+| `torchrun.sh` | Start `train.py` with the Trainer runtime's `PET_*` environment |
+| `pipeline.py` | Register the pipeline, if needed, and start a run |
+| `run-million.sh` | Draw 1,000,000 images, then start a one-epoch pipeline run |
+| `tests/test_handoff.py` | Shrink-guard and metric-name checks. No cluster and no GPU |
+| `scaling-to-one-million.md` | Draw and train the million-image corpus |
+| `manifests/` | Project, volumes, workbench, pipeline server, and TrainJob RBAC |
 
-Run the local checks with `python -m unittest tests.test_handoff`.
+```bash
+python -m unittest tests.test_handoff
+```
 
-## After the first run
+## For the next person who changes it
 
-- Compare runs under **Develop and train → Experiments (MLflow)**. The dashboard view is read-only. See [Track and compare MLflow experiments](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_mlflow/track-and-compare-mlflow-experiments_mlflow).
-- The checkpoint to promote later is the path passed as `checkpoint`. The default run writes `/data/models/resnet18.pt`.
-- Copy any changed script under `/data/code` before the next run. Pipeline version `v2` is already uploaded. A change to the graph in `pipeline.py` needs a new `VERSION_NAME`. A change only to the scripts on the volume does not.
+Copy any script you edit into `/data/code` before the next run. Pipeline version `v2` is already the graph in this repo. A change to the component code in `pipeline.py` needs a new `VERSION_NAME`, because the server will not replace a version. A change only to the scripts on the volume does not.
+
+Compare runs in **Develop and train → Experiments (MLflow)**. The dashboard view is read-only. [Track and compare experiments](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/working_with_mlflow/track-and-compare-mlflow-experiments_mlflow).
